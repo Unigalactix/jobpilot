@@ -1,0 +1,522 @@
+"""
+ai_engine.py  —  All AI logic powered by Claude
+
+Functions:
+  score_ats()                 — ATS score with category breakdown
+  tailor_resume()             — Full resume tailoring for a specific job
+  improve_line()              — Improve a single bullet with AI
+  apply_chat_instruction()    — Apply ANY natural language change to resume
+  suggest_certifications()    — Smart cert suggestions based on job + role
+  answer_screening_question() — Answer application screening questions
+"""
+
+import anthropic
+import json
+import re
+import os
+
+
+def _clean_resume(text: str) -> str:
+    """
+    Clean up common AI formatting artifacts from resume output:
+    - Collapse 3+ consecutive blank lines into max 1 blank line
+    - Remove trailing whitespace from every line
+    - Strip trailing blank lines at end of document
+    """
+    lines = text.split('\n')
+    # Strip trailing whitespace from each line
+    lines = [l.rstrip() for l in lines]
+    # Collapse consecutive blank lines (3+ → 1)
+    cleaned = []
+    blank_count = 0
+    for line in lines:
+        if line == '':
+            blank_count += 1
+            if blank_count <= 1:
+                cleaned.append(line)
+        else:
+            blank_count = 0
+            cleaned.append(line)
+    # Strip trailing blank lines at end
+    while cleaned and cleaned[-1] == '':
+        cleaned.pop()
+    return '\n'.join(cleaned)
+
+
+def _client() -> anthropic.Anthropic:
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        raise ValueError("ANTHROPIC_API_KEY not set in .env file")
+    return anthropic.Anthropic(api_key=key)
+
+
+def _call(prompt: str, max_tokens: int = 2000) -> str:
+    """Single Claude call, returns text."""
+    msg = _client().messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return msg.content[0].text.strip()
+
+
+def _call_json(prompt: str, max_tokens: int = 800) -> dict:
+    """Claude call expecting JSON back."""
+    raw = _call(prompt, max_tokens)
+    raw = re.sub(r"```json|```", "", raw).strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Try to extract JSON from response
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        raise
+
+
+# ── ATS Scoring ───────────────────────────────────────────────────────────────
+
+def score_ats(resume_text: str, job_description: str) -> dict:
+    """
+    Score a resume against a job description.
+    Returns: score, verdict, categories, matched/missing keywords, tip
+    """
+    prompt = f"""You are an expert ATS (Applicant Tracking System) analyst with deep knowledge of hiring systems used by Amazon, Microsoft, Google, and Meta.
+
+Analyze how well this resume matches the job description. Be accurate and honest — do not inflate scores.
+
+Return a JSON object with these exact keys:
+{{
+  "score": <integer 0-100>,
+  "verdict": <"Excellent Match" | "Strong Match" | "Good Match" | "Weak Match">,
+  "matched_keywords": [<list of up to 12 important keywords/phrases found in BOTH>],
+  "missing_keywords":  [<list of up to 6 important JD keywords NOT in resume>],
+  "categories": {{
+    "core_skills":        <integer 0-100>,
+    "experience_match":   <integer 0-100>,
+    "tools_technologies": <integer 0-100>,
+    "domain_knowledge":   <integer 0-100>,
+    "soft_skills":        <integer 0-100>
+  }},
+  "tip": "<one specific, actionable sentence — the single most impactful change to make>"
+}}
+
+Return ONLY valid JSON. No markdown, no backticks, no explanation outside the JSON.
+
+RESUME:
+{resume_text[:6000]}
+
+JOB DESCRIPTION:
+{job_description[:3000]}"""
+
+    try:
+        return _call_json(prompt, 900)
+    except Exception as e:
+        print(f"[ats] Score error: {e}")
+        return {
+            "score": 0, "verdict": "Error",
+            "matched_keywords": [], "missing_keywords": [],
+            "categories": {
+                "core_skills": 0, "experience_match": 0,
+                "tools_technologies": 0, "domain_knowledge": 0, "soft_skills": 0
+            },
+            "tip": f"Scoring failed: {e}"
+        }
+
+
+# ── Resume Tailoring ──────────────────────────────────────────────────────────
+
+def _extract_section(text: str, header: str) -> str:
+    """Extract a named section from resume text (e.g. EDUCATION, CERTIFICATIONS)."""
+    lines = text.split("\n")
+    in_section = False
+    result = []
+    header_up = header.upper()
+    for line in lines:
+        stripped = line.strip().upper()
+        if stripped == header_up or stripped.startswith(header_up):
+            in_section = True
+            result.append(line)
+            continue
+        if in_section:
+            # Stop at next ALL-CAPS section header
+            if stripped and stripped == stripped.replace(" ", "").upper().replace("&","").replace("/","") and len(stripped) > 3 and stripped != stripped.lower() and all(c.isupper() or not c.isalpha() for c in stripped):
+                break
+            result.append(line)
+    return "\n".join(result).strip()
+
+
+def _replace_section_in_output(output: str, header: str, replacement: str) -> str:
+    """Replace whatever the AI wrote for a section with the real content."""
+    lines = output.split("\n")
+    result = []
+    skip = False
+    header_up = header.upper()
+    inserted = False
+    for line in lines:
+        stripped = line.strip().upper()
+        is_header = stripped == header_up or stripped.startswith(header_up + " ")
+        if is_header and not inserted:
+            # Insert real section instead
+            result.append(replacement)
+            result.append("")
+            skip = True
+            inserted = True
+            continue
+        if skip:
+            # Skip lines until the next section header
+            if stripped and all(c.isupper() or not c.isalpha() for c in stripped) and len(stripped) > 3 and stripped != stripped.lower():
+                skip = False
+                result.append(line)
+            continue
+        result.append(line)
+    if not inserted:
+        # Section wasn't found — append it
+        result.append("")
+        result.append(replacement)
+    return "\n".join(result)
+
+
+def tailor_resume(
+    resume_text: str,
+    job_description: str,
+    job_title: str,
+    company: str
+) -> str:
+    """
+    Tailor a resume for a specific job.
+    Education and certifications are ALWAYS taken directly from the original resume in code —
+    the AI is not trusted to handle these sections.
+    """
+    # Extract education and certifications directly from original — AI will NOT touch these
+    real_education     = _extract_section(resume_text, "EDUCATION")
+    real_certifications = _extract_section(resume_text, "CERTIFICATIONS")
+
+    prompt = f"""You are an expert resume writer and ATS optimization specialist.
+
+Tailor the resume below for this specific {job_title} role at {company}.
+
+RULES:
+1. Keep ALL experience EXACTLY as-is — companies, job titles, dates are NEVER changed
+2. Rewrite the Professional Summary to directly mirror the job description's language and keywords
+3. Strengthen bullet points by naturally weaving in JD keywords — keep bullets human-readable
+4. Format bullets: [Strong action verb] + [what you built/did] + [measurable impact]
+5. Reorder Technical Skills to put the most relevant skills for this job first
+6. For EDUCATION: write exactly the text "EDUCATION_PLACEHOLDER"
+7. For CERTIFICATIONS: write exactly the text "CERTIFICATIONS_PLACEHOLDER"
+8. Keep the same section structure
+9. Target 90%+ ATS score for this specific role
+
+JOB TITLE: {job_title}
+COMPANY: {company}
+
+JOB DESCRIPTION:
+{job_description[:2500]}
+
+ORIGINAL RESUME:
+{resume_text[:6000]}
+
+Return ONLY the complete tailored resume as plain text. No preamble, no explanation."""
+
+    try:
+        result = _call(prompt, 4000)
+
+        # Always replace education and certifications with the originals — no matter what AI wrote
+        if real_education:
+            if "EDUCATION_PLACEHOLDER" in result:
+                result = result.replace("EDUCATION_PLACEHOLDER", real_education)
+            else:
+                result = _replace_section_in_output(result, "EDUCATION", real_education)
+
+        if real_certifications:
+            if "CERTIFICATIONS_PLACEHOLDER" in result:
+                result = result.replace("CERTIFICATIONS_PLACEHOLDER", real_certifications)
+            else:
+                result = _replace_section_in_output(result, "CERTIFICATIONS", real_certifications)
+
+        return _clean_resume(result)
+    except Exception as e:
+        print(f"[tailor] Error: {e}")
+        return resume_text
+
+
+# ── Chat Instruction ──────────────────────────────────────────────────────────
+
+def apply_chat_instruction(
+    instruction: str,
+    resume_text: str,
+    description: str = "",
+    job_title:   str = "",
+    company:     str = "",
+    chat_history: list = None,
+) -> dict:
+    """
+    Smart resume assistant — detects intent first:
+    - If the message is a question or general conversation → reply naturally, no resume edit
+    - If it's an edit instruction → apply it, return updated resume + explanation
+    - If it's both (e.g. "what certs should I add? also add AWS one") → do both
+
+    Full chat history is sent to Claude so it remembers the conversation.
+    Returns {"resume": str, "explanation": str, "resume_changed": bool}
+    """
+    jd_context = f"Job: {job_title} at {company}\n\nJob Description:\n{description[:1500]}" if description else ""
+    history = chat_history or []
+
+    # Build conversation history as Claude messages
+    messages = []
+    for msg in history:
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["text"]})
+
+    # System prompt — makes Claude behave like a smart resume assistant
+    system_prompt = f"""You are an expert resume assistant and career coach helping a job applicant.
+
+You have access to their current resume and the job description they are targeting.
+
+Your job is to:
+1. DETECT INTENT — figure out what the user actually wants:
+   - Is this a QUESTION? (e.g. "what should I improve?", "what certs should I add?", "is my summary good?") → Answer conversationally, do NOT edit the resume
+   - Is this an EDIT INSTRUCTION? (e.g. "remove the gap", "add a bullet about Python", "make it shorter") → Edit the resume and explain what you changed
+   - Is this BOTH? → Answer the question AND apply the edit
+   - Is this FEEDBACK or CONVERSATION? (e.g. "looks good", "thanks", "ok") → Respond naturally
+
+2. WHEN EDITING, follow these rules:
+   - "remove X" → remove it completely
+   - "add X" → add it in the right place
+   - "make shorter" / "fit 1 page" → trim bullets, remove less important points
+   - "expand" / "fill 2 pages" / "add more content" → add strong detail, more bullets, quantified achievements
+   - "remove the gap" / "fix spacing" → remove extra blank lines in that section
+   - Keep all real data (companies, dates, education) unchanged unless told otherwise
+
+3. RESPONSE FORMAT:
+   - If NO resume edit needed: just reply conversationally. Start your response with "ANSWER:"
+   - If resume WAS edited: respond in this format:
+     UPDATED RESUME:
+     [full updated resume as plain text]
+     EXPLANATION:
+     [1-2 natural sentences explaining what you changed and why]
+
+{jd_context}
+
+CURRENT RESUME:
+{resume_text}"""
+
+    # Add current user message
+    messages.append({"role": "user", "content": instruction})
+
+    try:
+        client = _client()
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=3200,
+            system=system_prompt,
+            messages=messages,
+        )
+        raw = msg.content[0].text.strip()
+
+        # Parse response
+        if raw.startswith("ANSWER:"):
+            # Pure conversational reply — no resume change
+            answer = raw[len("ANSWER:"):].strip()
+            return {"resume": resume_text, "explanation": answer, "resume_changed": False}
+
+        if "UPDATED RESUME:" in raw and "EXPLANATION:" in raw:
+            parts_exp = raw.split("EXPLANATION:", 1)
+            explanation = parts_exp[1].strip()
+            resume_raw  = parts_exp[0].strip()
+            if resume_raw.startswith("UPDATED RESUME:"):
+                resume_raw = resume_raw[len("UPDATED RESUME:"):].strip()
+            return {"resume": _clean_resume(resume_raw), "explanation": explanation, "resume_changed": True}
+
+        if "UPDATED RESUME:" in raw:
+            resume_raw = raw.split("UPDATED RESUME:", 1)[1].strip()
+            return {"resume": _clean_resume(resume_raw), "explanation": "Applied your change.", "resume_changed": True}
+
+        # Fallback — treat whole response as explanation (no edit)
+        return {"resume": resume_text, "explanation": raw, "resume_changed": False}
+
+    except Exception as e:
+        print(f"[chat_instruction] Error: {e}")
+        return {"resume": resume_text, "explanation": f"Error: {e}", "resume_changed": False}
+
+
+# ── Smart Certification Suggestions ──────────────────────────────────────────
+
+def suggest_certifications(
+    resume_text:  str,
+    description:  str,
+    job_title:    str = "",
+    company:      str = "",
+) -> dict:
+    """
+    Analyze the job description and suggest the best certifications.
+
+    Returns:
+      - keep: certs in resume that are relevant to this job
+      - remove: certs in resume that are NOT relevant to this job
+      - add: new certs to add (with reasoning)
+      - updated_cert_section: ready-to-paste certifications section
+    """
+    prompt = f"""You are an expert career advisor who knows certifications deeply.
+
+Analyze this resume and job description. Provide smart certification recommendations.
+
+Return a JSON object:
+{{
+  "keep": [
+    {{"name": "<cert name>", "reason": "<why it's relevant for this role>"}}
+  ],
+  "remove": [
+    {{"name": "<cert name>", "reason": "<why it's not relevant for this role>"}}
+  ],
+  "add": [
+    {{
+      "name": "<full certification name>",
+      "provider": "<e.g. AWS, Microsoft, Google, Databricks>",
+      "reason": "<specific reason this cert helps for this exact role>",
+      "difficulty": "<Easy | Medium | Hard>",
+      "time_to_get": "<e.g. 1-2 weeks, 1-2 months>"
+    }}
+  ],
+  "updated_cert_section": "<complete ready-to-paste certifications section as plain text, one cert per line>"
+}}
+
+RULES for adding certs:
+- Only suggest REAL, well-known, verifiable certifications
+- Must be directly relevant to the job title and company
+- Consider the candidate's existing background — suggest certs they can realistically get
+- Prioritize vendor certs from companies the job uses (AWS, Azure, GCP, Databricks, etc.)
+- Max 4-5 certs total in the final section
+- No made-up or obscure certs
+
+JOB TITLE: {job_title}
+COMPANY: {company}
+
+JOB DESCRIPTION:
+{description[:2000]}
+
+CURRENT RESUME (for existing certs and background):
+{resume_text[:2500]}
+
+Return ONLY valid JSON. No markdown, no explanation outside the JSON."""
+
+    try:
+        return _call_json(prompt, 1000)
+    except Exception as e:
+        print(f"[certs] Error: {e}")
+        return {
+            "keep": [], "remove": [], "add": [],
+            "updated_cert_section": "",
+            "error": str(e)
+        }
+
+
+# ── Improve Single Line ───────────────────────────────────────────────────────
+
+def improve_line(line: str, job_description: str = "", job_title: str = "") -> str:
+    """Improve a single resume bullet point with AI."""
+    context = f" for a {job_title} role" if job_title else ""
+    jd_hint = f"\n\nJob description context:\n{job_description[:800]}" if job_description else ""
+
+    prompt = f"""You are an expert resume writer.
+
+Improve this resume bullet point{context}. Make it:
+- Start with a stronger, more specific action verb
+- More quantified and impactful (add metrics if possible)
+- Include relevant keywords naturally
+- Concise and punchy — max 2 sentences
+- Sound human and genuine, not robotic
+
+ORIGINAL BULLET: {line}
+{jd_hint}
+
+Return ONLY the improved bullet text. Nothing else."""
+
+    try:
+        return _call(prompt, 200)
+    except Exception as e:
+        print(f"[improve_line] Error: {e}")
+        return line
+
+
+# ── Generate Resume from Scratch ─────────────────────────────────────────────
+
+def generate_resume(user_description: str, job_title: str = "", job_description: str = "") -> str:
+    """
+    Generate a complete, professional resume from a free-text description of the user.
+    The user can describe themselves conversationally — Claude builds the full resume.
+
+    Example user_description:
+      "I'm a software engineer with 5 years of experience at Google and Amazon.
+       I worked on distributed systems, Python, Go, Kubernetes. I have a BS in CS
+       from UT Austin. I want to apply for senior backend roles."
+    """
+    job_context = ""
+    if job_title or job_description:
+        job_context = f"""
+Target job: {job_title}
+
+Job Description (tailor the resume towards this):
+{job_description[:2000]}
+"""
+
+    prompt = f"""You are a world-class resume writer. Create a complete, professional, ATS-optimized resume based on the user's description below.
+
+{job_context}
+
+USER DESCRIPTION:
+{user_description}
+
+RESUME REQUIREMENTS:
+- Start with the person's full name (centered, largest text)
+- Contact line: Phone | Email | LinkedIn | Location (use realistic placeholders if not provided — mark them with [FILL IN])
+- Professional Summary: 3-4 impactful sentences tailored to their experience and the target job
+- EXPERIENCE section: each role formatted as "Company | Job Title  Month Year – Month Year", followed by 3-5 strong bullet points with action verbs and quantified impact
+- TECHNICAL SKILLS section: organized by category (Languages, Frameworks, Tools, Cloud, etc.)
+- EDUCATION section: degree, university, graduation year
+- CERTIFICATIONS section: only if mentioned or highly relevant
+- Use strong action verbs: Architected, Engineered, Led, Reduced, Increased, Deployed, etc.
+- Quantify achievements wherever possible (even estimated: "reduced latency by ~30%")
+- Format bullets as: [Action verb] [what you did] [measurable impact]
+- Write in plain text — no markdown symbols, no asterisks
+- Section headers in ALL CAPS
+
+Return ONLY the complete resume as plain text. No preamble, no explanation, no commentary."""
+
+    try:
+        return _clean_resume(_call(prompt, max_tokens=4000))
+    except Exception as e:
+        print(f"[generate_resume] Error: {e}")
+        return ""
+
+
+# ── Answer Screening Question ─────────────────────────────────────────────────
+
+def answer_screening_question(
+    question:    str,
+    resume_text: str,
+    job_description: str = ""
+) -> str:
+    """Generate a strong answer to a job application screening question."""
+    prompt = f"""You are helping a job applicant answer a screening question honestly and compellingly.
+
+Write a strong, genuine, first-person answer (3-5 sentences) based on their actual experience.
+Be specific — reference real projects and technologies from their resume.
+Sound confident and natural, not rehearsed or robotic.
+Match the answer to what the job description is looking for.
+
+QUESTION: {question}
+
+RESUME:
+{resume_text[:2000]}
+
+JOB DESCRIPTION:
+{job_description[:800]}
+
+Return ONLY the answer text. No preamble, no "Here is your answer:", just the answer itself."""
+
+    try:
+        return _call(prompt, 400)
+    except Exception as e:
+        print(f"[answer] Error: {e}")
+        return f"Error generating answer: {e}"
