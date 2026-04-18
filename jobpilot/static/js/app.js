@@ -10,6 +10,7 @@
  */
 
 const API = "";  // same origin
+const LAYOUT_STORAGE_KEY = "jobpilot-layout-widths";
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let allJobs      = [];
@@ -198,9 +199,119 @@ document.addEventListener("DOMContentLoaded", () => {
   checkHealth();
   setupAutocomplete("job-title-input", JOB_TITLES);
   setupAutocomplete("location-input", US_LOCATIONS);
+  initPanelResizers();
   const inp = document.getElementById("job-title-input");
   if (inp) inp.focus();
 });
+
+function initPanelResizers() {
+  const layout = document.getElementById("app-layout");
+  if (!layout) return;
+
+  restorePanelLayout(layout);
+
+  let activeSide = null;
+  let activeHandle = null;
+
+  const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+  const setWidth = (side, px) => {
+    const rect = layout.getBoundingClientRect();
+    if (side === "left") {
+      const maxLeft = Math.max(220, rect.width - 520);
+      layout.style.setProperty("--left-panel-width", `${Math.round(clamp(px, 180, maxLeft))}px`);
+    } else {
+      const maxRight = Math.max(320, rect.width - 340);
+      layout.style.setProperty("--right-panel-width", `${Math.round(clamp(px, 300, maxRight))}px`);
+    }
+  };
+  const readWidths = () => ({
+    left: parseFloat(getComputedStyle(layout).getPropertyValue("--left-panel-width")) || 240,
+    right: parseFloat(getComputedStyle(layout).getPropertyValue("--right-panel-width")) || 460,
+  });
+
+  const stopResize = () => {
+    if (!activeSide) return;
+    activeSide = null;
+    layout.classList.remove("resizing");
+    if (activeHandle) activeHandle.classList.remove("dragging");
+    activeHandle = null;
+    document.body.style.userSelect = "";
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(readWidths()));
+  };
+
+  layout.querySelectorAll(".panel-resizer").forEach(handle => {
+    const side = handle.dataset.resize;
+
+    handle.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      activeSide = side;
+      activeHandle = handle;
+      layout.classList.add("resizing");
+      handle.classList.add("dragging");
+      document.body.style.userSelect = "none";
+    });
+
+    handle.addEventListener("dblclick", () => {
+      resetPanelLayout(layout);
+      showToast("Layout reset to default", "success");
+    });
+
+    handle.addEventListener("keydown", (e) => {
+      const step = e.shiftKey ? 40 : 20;
+      const widths = readWidths();
+
+      if (side === "left" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        setWidth("left", widths.left + (e.key === "ArrowRight" ? step : -step));
+      }
+      if (side === "right" && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+        e.preventDefault();
+        setWidth("right", widths.right + (e.key === "ArrowLeft" ? step : -step));
+      }
+      localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(readWidths()));
+    });
+  });
+
+  window.addEventListener("pointermove", (e) => {
+    if (!activeSide) return;
+    const rect = layout.getBoundingClientRect();
+
+    if (activeSide === "left") {
+      setWidth("left", e.clientX - rect.left);
+    } else {
+      setWidth("right", rect.right - e.clientX);
+    }
+  });
+
+  window.addEventListener("pointerup", stopResize);
+  window.addEventListener("pointercancel", stopResize);
+}
+
+function restorePanelLayout(layout) {
+  try {
+    const saved = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY) || "null");
+    if (!saved) return;
+
+    const rect = layout.getBoundingClientRect();
+    const clamp = (n, min, max) => Math.min(Math.max(n, min), max);
+    if (saved.left) {
+      const maxLeft = Math.max(220, rect.width - 520);
+      layout.style.setProperty("--left-panel-width", `${Math.round(clamp(saved.left, 180, maxLeft))}px`);
+    }
+    if (saved.right) {
+      const maxRight = Math.max(320, rect.width - 340);
+      layout.style.setProperty("--right-panel-width", `${Math.round(clamp(saved.right, 300, maxRight))}px`);
+    }
+  } catch {
+    localStorage.removeItem(LAYOUT_STORAGE_KEY);
+  }
+}
+
+function resetPanelLayout(layout) {
+  layout.style.removeProperty("--left-panel-width");
+  layout.style.removeProperty("--right-panel-width");
+  localStorage.removeItem(LAYOUT_STORAGE_KEY);
+}
 
 // ── Usage panel ───────────────────────────────────────────────────────────────
 async function toggleUsagePanel() {

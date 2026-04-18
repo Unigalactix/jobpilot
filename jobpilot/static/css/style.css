@@ -109,11 +109,49 @@ body {
 
 /* ── LAYOUT ── */
 .layout {
+  --left-panel-width: 240px;
+  --right-panel-width: 460px;
+  --resizer-size: 10px;
   display: grid;
-  grid-template-columns: 240px 1fr 460px;
+  grid-template-columns:
+    var(--left-panel-width)
+    var(--resizer-size)
+    minmax(320px, 1fr)
+    var(--resizer-size)
+    var(--right-panel-width);
   height: calc(100vh - 50px);
   margin-top: 50px;
   overflow: hidden;
+}
+
+.panel-resizer {
+  position: relative;
+  background: linear-gradient(180deg, transparent 0%, rgba(108,99,255,0.04) 50%, transparent 100%);
+  cursor: col-resize;
+  user-select: none;
+  touch-action: none;
+}
+.panel-resizer::before {
+  content: '';
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  border-radius: 2px;
+  background: var(--border2);
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.panel-resizer:hover::before,
+.panel-resizer.dragging::before,
+.layout.resizing .panel-resizer::before {
+  background: var(--primary);
+  box-shadow: 0 0 12px rgba(108,99,255,0.5);
+}
+.layout.resizing,
+.layout.resizing * {
+  cursor: col-resize !important;
 }
 
 /* ── SIDEBAR ── */
@@ -963,9 +1001,28 @@ body {
 
 /* ── RESPONSIVE ── */
 @media (max-width: 1300px) {
-  .layout { grid-template-columns: 220px 1fr 420px; }
+  .layout {
+    --left-panel-width: 220px;
+    --right-panel-width: 420px;
+  }
 }
 @media (max-width: 1100px) {
-  .layout { grid-template-columns: 200px 1fr 380px; }
+  .layout {
+    --left-panel-width: 200px;
+    --right-panel-width: 380px;
+  }
   .brand-sub { display: none; }
+}
+@media (max-width: 900px) {
+  .layout {
+    --left-panel-width: 180px;
+    --right-panel-width: 320px;
+    --resizer-size: 8px;
+    grid-template-columns:
+      var(--left-panel-width)
+      var(--resizer-size)
+      minmax(240px, 1fr)
+      var(--resizer-size)
+      var(--right-panel-width);
+  }
 }
